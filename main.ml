@@ -1,4 +1,5 @@
-(* phase 1: raw mode, key decoding, clean exit *)
+(* phase 1: raw mode, key decoding, clean exit 
+ * phase 2: drawing the screen and moving the cursor *)
 
 (* ----- terminal ----- *)
 
@@ -12,7 +13,7 @@ let disable_raw_mode () =
 let enable_raw_mode () =
   let t = Unix.tcgetattr Unix.stdin in
   orig_termios := Some t;
-  (* restore the terminal however we exit, including uncaught exceptions. *)
+  (* restore the terminal however we exit, including uncaught exceptions *)
   at_exit disable_raw_mode;
   let raw =
     { t with
@@ -48,16 +49,15 @@ type key =
 
 let buf = Bytes.create 1
 
-(* blocking read of one byte. retries if a signal interrupts the read
-   (this matters in Phase 2 when we handle window resize). *)
+(* blocking read of one byte - retries if a signal interrupts the read *)
 let rec read_byte () : char =
   match Unix.read Unix.stdin buf 0 1 with
   | 0 -> exit 0 (* EOF *)
   | _ -> Bytes.get buf 0
   | exception Unix.Unix_error (Unix.EINTR, _, _) -> read_byte ()
 
-(* read one byte, giving up after [timeout] seconds. used to tell a
-   lone Escape keypress apart from the start of an escape sequence. *)
+(* read one byte, giving up after [timeout] seconds - used to tell a
+   lone Escape keypress apart from the start of an escape sequence *)
 let read_byte_timeout timeout : char option =
   match Unix.select [ Unix.stdin ] [] [] timeout with
   | [], _, _ -> None
@@ -67,7 +67,7 @@ let read_byte_timeout timeout : char option =
 (* arrow keys etc. arrive as multi-byte sequences:
      ESC [ A        Up            ESC [ 3 ~     Delete
      ESC [ H        Home          ESC [ 5 ~     Page Up
-     ESC O H        Home (some terminals)                     *)
+     ESC O H        Home (some terminals)                *)
 let read_escape_sequence () : key =
   let next () = read_byte_timeout 0.05 in
   match next () with
@@ -106,43 +106,111 @@ let read_key () : key =
   | '\t' -> Tab
   | '\x7f' -> Backspace
   | c when Char.code c < 32 ->
-      (* ctrl-A is byte 1, ctrl-B is 2, ... so add 96 to get the letter. *)
+      (* ctrl-A is byte 1, ctrl-B is 2, ... so add 96 to get the letter *)
       Ctrl (Char.chr (Char.code c + 96))
   | c -> Char c
 
-(* ----- phase 1 demo loop ----- *)
+(* ----- output ----- *)
 
-let string_of_key = function
-  | Char c -> Printf.sprintf "Char %C (byte %d)" c (Char.code c)
-  | Ctrl c -> Printf.sprintf "Ctrl-%c" (Char.uppercase_ascii c)
-  | Enter -> "Enter"
-  | Tab -> "Tab"
-  | Backspace -> "Backspace"
-  | Delete -> "Delete"
-  | Escape -> "Escape"
-  | Up -> "Up"
-  | Down -> "Down"
-  | Left -> "Left"
-  | Right -> "Right"
-  | Home -> "Home"
-  | End -> "End"
-  | Page_up -> "Page_up"
-  | Page_down -> "Page_down"
+let clear_screen = "\x1b[2J"   (* erase everything *)
+let clear_line   = "\x1b[K"    (* erase from the cursor to the end of the line *)
+let cursor_home  = "\x1b[H"    (* move the cursor to the top-left corner *)
+let hide_cursor  = "\x1b[?25l"
+let show_cursor  = "\x1b[?25h"
 
-(* output post-processing is off, so we must send "\r\n" ourselves *)
-let print_line s =
+(* move the cursor to a row and column. the terminal counts from 1,
+ * but our code counts from 0, hence the +1 *)
+let cursor_to ~row ~col = Printf.sprintf "\x1b[%d;%dH" (row + 1) (col + 1)
+
+(* send a string to the terminal right now *)
+let write s =
   print_string s;
-  print_string "\r\n";
   flush stdout
+
+(* ----- window size -----
+ * OCaml's Unix module cannot natively tell us the size of the window, 
+ * so we must ask the terminal itself:
+ *   1. push the cursor 999 right and 999 down; it stops at the corner
+ *   2. send ESC [ 6 n, which means "report where the cursor is"
+ *   3. the terminal answers on stdin with  ESC [ rows ; cols R *)
+let get_window_size () : int * int =
+  write "\x1b[999C\x1b[999B\x1b[6n";
+  let reply = Buffer.create 16 in
+  let rec collect () =
+    match read_byte_timeout 1.0 with
+    | Some 'R' | None -> ()
+    | Some c ->
+        Buffer.add_char reply c;
+        collect ()
+  in
+  collect ();
+  try Scanf.sscanf (Buffer.contents reply) "\x1b[%d;%d" (fun r c -> (r, c))
+  with Scanf.Scan_failure _ | Failure _ | End_of_file -> (24, 80)
+
+(* ----- editor state -----
+ * everything the editor knows - it is immutable: moving the cursor
+ * produces a new record rather than changing this one *)
+type editor = {
+  rows : int;  (* window height *)
+  cols : int;  (* window width *)
+  cx : int;    (* cursor column, 0 = left edge *)
+  cy : int;    (* cursor row, 0 = top *)
+}
+
+(* ----- drawing ----- *)
+
+let welcome = "OCaml editor -- phase 2 -- Ctrl-Q to quit"
+
+(* the text for one screen row - there is no file yet, so every row is a "~"
+ * like vim's empty lines, with a welcome message a third of the way down *)
+let row_text e y =
+  if y = e.rows / 3 && String.length welcome < e.cols then
+    let padding = (e.cols - String.length welcome) / 2 in
+    "~" ^ String.make (max 0 (padding - 1)) ' ' ^ welcome
+  else "~"
+
+(* redraw the whole screen - the frame is assembled in a buffer and sent
+ * with a single write, so the terminal never shows a half-drawn screen *)
+let refresh_screen e =
+  let b = Buffer.create 4096 in
+  Buffer.add_string b hide_cursor;
+  Buffer.add_string b cursor_home;
+  for y = 0 to e.rows - 1 do
+    Buffer.add_string b (row_text e y);
+    Buffer.add_string b clear_line;
+    (* no newline after the last row, or the screen would scroll *)
+    if y < e.rows - 1 then Buffer.add_string b "\r\n"
+  done;
+  Buffer.add_string b (cursor_to ~row:e.cy ~col:e.cx);
+  Buffer.add_string b show_cursor;
+  write (Buffer.contents b)
+
+(* ------ reacting to keys ----- *)
+
+(* given the current state and a key, return the next state
+ * [min and max keep the cursor inside the window] *)
+let move e key =
+  match key with
+  | Left -> { e with cx = max 0 (e.cx - 1) }
+  | Right -> { e with cx = min (e.cols - 1) (e.cx + 1) }
+  | Up -> { e with cy = max 0 (e.cy - 1) }
+  | Down -> { e with cy = min (e.rows - 1) (e.cy + 1) }
+  | Home -> { e with cx = 0 }
+  | End -> { e with cx = e.cols - 1 }
+  | Page_up -> { e with cy = 0 }
+  | Page_down -> { e with cy = e.rows - 1 }
+  | _ -> e
+
+(* ----- main loop ----- *)
 
 let () =
   enable_raw_mode ();
-  print_line "press keys to see how they decode. ctrl-Q to quit";
-  let rec loop () =
+  let rows, cols = get_window_size () in
+  (* draw, wait for a key, compute the new state, repeat *)
+  let rec loop e =
+    refresh_screen e;
     match read_key () with
-    | Ctrl 'q' -> ()
-    | k ->
-        print_line (string_of_key k);
-        loop ()
+    | Ctrl 'q' -> write (clear_screen ^ cursor_home)
+    | k -> loop (move e k)
   in
-  loop ()
+  loop { rows; cols; cx = 0; cy = 0 }
